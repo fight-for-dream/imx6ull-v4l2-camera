@@ -1,0 +1,249 @@
+#include "record.h"
+#include "avi_writer.h"
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define RECORD_QUEUE_SIZE 8
+#define RECORD_MAX_SIZE   (100UL * 1024UL * 1024UL)
+#define RECORD_WIDTH      640
+#define RECORD_HEIGHT     480
+#define RECORD_FPS        20
+
+struct record_frame
+{
+	unsigned char *pucData;
+	unsigned int iLength;
+};
+
+struct record_context
+{
+	struct avi_writer *ptAvi;
+	pthread_t tThread;
+	pthread_mutex_t tLock;
+	pthread_cond_t tFrameReady;
+	struct record_frame atQueue[RECORD_QUEUE_SIZE];
+	unsigned int iReadPos;
+	unsigned int iWritePos;
+	unsigned int iQueueCount;
+	unsigned int iWrittenFrames;
+	unsigned int iDroppedFrames;
+	unsigned int iRecordNumber;
+	unsigned long iAcceptedBytes;
+	unsigned long iWrittenBytes;
+	int iStopping;
+};
+
+static struct record_context g_tRecorder =
+{
+	.tLock = PTHREAD_MUTEX_INITIALIZER,
+	.tFrameReady = PTHREAD_COND_INITIALIZER,
+};
+
+static void FreeQueueLocked(void)
+{
+	struct record_frame *ptFrame;
+
+	while (g_tRecorder.iQueueCount > 0)
+	{
+		ptFrame = &g_tRecorder.atQueue[g_tRecorder.iReadPos];
+		free(ptFrame->pucData);
+		ptFrame->pucData = NULL;
+		g_tRecorder.iReadPos =
+			(g_tRecorder.iReadPos + 1) % RECORD_QUEUE_SIZE;
+		g_tRecorder.iQueueCount--;
+	}
+}
+
+static void *RecordThread(void *pArgument)
+{
+	struct record_frame tFrame;
+
+	(void)pArgument;
+	while (1)
+	{
+		pthread_mutex_lock(&g_tRecorder.tLock);
+		while (g_tRecorder.iQueueCount == 0 && !g_tRecorder.iStopping)
+			pthread_cond_wait(&g_tRecorder.tFrameReady,
+					  &g_tRecorder.tLock);
+		if (g_tRecorder.iQueueCount == 0 && g_tRecorder.iStopping)
+		{
+			pthread_mutex_unlock(&g_tRecorder.tLock);
+			break;
+		}
+
+		tFrame = g_tRecorder.atQueue[g_tRecorder.iReadPos];
+		g_tRecorder.iReadPos =
+			(g_tRecorder.iReadPos + 1) % RECORD_QUEUE_SIZE;
+		g_tRecorder.iQueueCount--;
+		pthread_mutex_unlock(&g_tRecorder.tLock);
+
+		if (AviWriterWriteFrame(g_tRecorder.ptAvi,
+					tFrame.pucData, tFrame.iLength) < 0)
+		{
+			perror("write AVI frame");
+			free(tFrame.pucData);
+			pthread_mutex_lock(&g_tRecorder.tLock);
+			g_tRecorder.iStopping = 1;
+			pthread_mutex_unlock(&g_tRecorder.tLock);
+			break;
+		}
+		free(tFrame.pucData);
+
+		pthread_mutex_lock(&g_tRecorder.tLock);
+		g_tRecorder.iWrittenFrames++;
+		g_tRecorder.iWrittenBytes += tFrame.iLength;
+		pthread_mutex_unlock(&g_tRecorder.tLock);
+	}
+	return NULL;
+}
+
+static void RecordStart(void)
+{
+	char acFileName[64];
+	struct avi_writer *ptAvi;
+	int iRet;
+
+	g_tRecorder.iRecordNumber++;
+	snprintf(acFileName, sizeof(acFileName), "record_%d_%u.avi",
+		 (int)getpid(), g_tRecorder.iRecordNumber);
+	ptAvi = AviWriterOpen(acFileName, RECORD_WIDTH,
+			      RECORD_HEIGHT, RECORD_FPS);
+	if (ptAvi == NULL)
+	{
+		perror("create AVI file");
+		return;
+	}
+
+	pthread_mutex_lock(&g_tRecorder.tLock);
+	g_tRecorder.ptAvi = ptAvi;
+	g_tRecorder.iReadPos = 0;
+	g_tRecorder.iWritePos = 0;
+	g_tRecorder.iQueueCount = 0;
+	g_tRecorder.iWrittenFrames = 0;
+	g_tRecorder.iDroppedFrames = 0;
+	g_tRecorder.iAcceptedBytes = 0;
+	g_tRecorder.iWrittenBytes = 0;
+	g_tRecorder.iStopping = 0;
+	iRet = pthread_create(&g_tRecorder.tThread, NULL, RecordThread, NULL);
+	if (iRet != 0)
+		g_tRecorder.ptAvi = NULL;
+	pthread_mutex_unlock(&g_tRecorder.tLock);
+
+	if (iRet != 0)
+	{
+		fprintf(stderr, "pthread_create: %s\n", strerror(iRet));
+		AviWriterClose(ptAvi);
+		return;
+	}
+	printf("AVI recording started: %s\n", acFileName);
+}
+
+void RecordToggle(void)
+{
+	int iRecording;
+
+	pthread_mutex_lock(&g_tRecorder.tLock);
+	iRecording = g_tRecorder.ptAvi != NULL;
+	pthread_mutex_unlock(&g_tRecorder.tLock);
+
+	if (iRecording)
+		RecordStop();
+	else
+		RecordStart();
+}
+
+void RecordWriteFrame(const unsigned char *pucJpeg, unsigned int iLength)
+{
+	struct record_frame *ptFrame;
+
+	pthread_mutex_lock(&g_tRecorder.tLock);
+	if (g_tRecorder.ptAvi == NULL)
+	{
+		pthread_mutex_unlock(&g_tRecorder.tLock);
+		return;
+	}
+	if (g_tRecorder.iStopping)
+	{
+		pthread_mutex_unlock(&g_tRecorder.tLock);
+		RecordStop();
+		return;
+	}
+	if (iLength > RECORD_MAX_SIZE - g_tRecorder.iAcceptedBytes)
+	{
+		pthread_mutex_unlock(&g_tRecorder.tLock);
+		printf("Recording reached the 100 MiB limit.\n");
+		RecordStop();
+		return;
+	}
+	if (g_tRecorder.iQueueCount == RECORD_QUEUE_SIZE)
+	{
+		g_tRecorder.iDroppedFrames++;
+		pthread_mutex_unlock(&g_tRecorder.tLock);
+		return;
+	}
+
+	ptFrame = &g_tRecorder.atQueue[g_tRecorder.iWritePos];
+	ptFrame->pucData = malloc(iLength);
+	if (ptFrame->pucData == NULL)
+	{
+		pthread_mutex_unlock(&g_tRecorder.tLock);
+		perror("allocate record frame");
+		return;
+	}
+	memcpy(ptFrame->pucData, pucJpeg, iLength);
+	ptFrame->iLength = iLength;
+	g_tRecorder.iWritePos =
+		(g_tRecorder.iWritePos + 1) % RECORD_QUEUE_SIZE;
+	g_tRecorder.iQueueCount++;
+	g_tRecorder.iAcceptedBytes += iLength;
+	pthread_cond_signal(&g_tRecorder.tFrameReady);
+	pthread_mutex_unlock(&g_tRecorder.tLock);
+}
+
+void RecordStop(void)
+{
+	struct avi_writer *ptAvi;
+	unsigned int iFrames;
+	unsigned int iDropped;
+	unsigned long iBytes;
+
+	pthread_mutex_lock(&g_tRecorder.tLock);
+	if (g_tRecorder.ptAvi == NULL)
+	{
+		pthread_mutex_unlock(&g_tRecorder.tLock);
+		return;
+	}
+	g_tRecorder.iStopping = 1;
+	pthread_cond_signal(&g_tRecorder.tFrameReady);
+	pthread_mutex_unlock(&g_tRecorder.tLock);
+
+	pthread_join(g_tRecorder.tThread, NULL);
+
+	pthread_mutex_lock(&g_tRecorder.tLock);
+	FreeQueueLocked();
+	ptAvi = g_tRecorder.ptAvi;
+	iFrames = g_tRecorder.iWrittenFrames;
+	iDropped = g_tRecorder.iDroppedFrames;
+	iBytes = g_tRecorder.iWrittenBytes;
+	g_tRecorder.ptAvi = NULL;
+	pthread_mutex_unlock(&g_tRecorder.tLock);
+
+	if (AviWriterClose(ptAvi) < 0)
+		fprintf(stderr, "Could not finish AVI file correctly.\n");
+	printf("Recording stopped: %u frames, %lu JPEG bytes, %u dropped.\n",
+	       iFrames, iBytes, iDropped);
+}
+
+int RecordIsActive(void)
+{
+	int iActive;
+
+	pthread_mutex_lock(&g_tRecorder.tLock);
+	iActive = g_tRecorder.ptAvi != NULL;
+	pthread_mutex_unlock(&g_tRecorder.tLock);
+	return iActive;
+}

@@ -1,0 +1,39 @@
+# 编译产物
+*.o
+*.a
+*.so
+*.ko
+
+# 各阶段生成的可执行文件
+v4l2_probe
+v4l2_capture_one
+v4l2_capture_loop
+v4l2_frame_interval
+v4l2_current_interval
+v4l2_capture_fps
+camera_preview
+camera_snapshot
+camera_mjpeg_server
+camera_recovery
+camera_recorder
+camera_async_recorder
+camera_avi_recorder
+camera_multi_http
+camera_web_control
+camera_web_controls
+
+# 运行时生成的图片、视频和测试响应
+frame.jpg
+camera_*.jpg
+record_*.mjpg
+record_*.avi
+*.avi.part
+stream_test.bin
+
+# 编辑器和系统文件
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
